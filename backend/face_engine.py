@@ -37,7 +37,7 @@ PRESENCE_THRESHOLD = 0.66
 MODEL_NAME = "ArcFace"
 DETECTOR_BACKEND = "retinaface"
 DISTANCE_METRIC = "cosine"
-VERIFY_THRESHOLD = 0.68  # ArcFace default cosine threshold
+VERIFY_THRESHOLD = 0.80  # Relaxed for webcam captures at varying distances
 
 # ─── Super-Resolution Config ──────────────────────────────────────
 # Minimum face size (px) before we apply super-resolution upscaling
@@ -629,6 +629,7 @@ def identify_faces_with_grid(
                     if usn in used_usns:
                         continue
                     dist = 1 - np.dot(stored_emb, face_emb)
+                    logger.info(f"Photo {i+1}: face vs {usn} => cosine_dist={dist:.4f} (threshold={VERIFY_THRESHOLD})")
                     if dist < best_distance:
                         best_distance = dist
                         best_usn = usn

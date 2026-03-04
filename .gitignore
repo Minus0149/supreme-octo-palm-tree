@@ -41,3 +41,11 @@ yarn-error.log*
 next-env.d.ts
 
 __pycache__
+
+# Backend data (face frames, encodings, grids, database)
+backend/data/faces/
+backend/data/encodings/
+backend/data/grids/
+backend/attendance.db
+backend/__pycache__/
+backend/routers/__pycache__/
