@@ -37,7 +37,11 @@ PRESENCE_THRESHOLD = 0.66
 MODEL_NAME = "ArcFace"
 DETECTOR_BACKEND = "retinaface"
 DISTANCE_METRIC = "cosine"
-VERIFY_THRESHOLD = 0.80  # Relaxed for webcam captures at varying distances
+VERIFY_THRESHOLD = 0.68  # ArcFace default cosine threshold (research shows 0.05-0.07 optimal in controlled environments)
+
+# ─── Anti-False-Positive Config ───────────────────────────────────
+MIN_FACE_AREA_PX = 30     # Minimum face width/height in pixels to accept
+MIN_CONFIDENCE_FLOOR = 25.0  # Minimum confidence % to report a match
 
 # ─── Super-Resolution Config ──────────────────────────────────────
 # Minimum face size (px) before we apply super-resolution upscaling
@@ -209,10 +213,17 @@ def train_student(usn: str) -> dict:
             result = DeepFace.represent(
                 img_path=processed_path,
                 model_name=MODEL_NAME,
-                enforce_detection=False,
+                enforce_detection=True,  # Critical: reject non-face frames from training
                 detector_backend=DETECTOR_BACKEND,
             )
             if result and len(result) > 0:
+                # Minimum size filter for training
+                facial_area = result[0].get("facial_area", {})
+                w, h = facial_area.get("w", 0), facial_area.get("h", 0)
+                if w < MIN_FACE_AREA_PX or h < MIN_FACE_AREA_PX:
+                    logger.warning(f"Skipping {fname}: face too small ({w}x{h}px)")
+                    continue
+
                 embedding = result[0]["embedding"]
                 all_embeddings.append(np.array(embedding))
                 quality_scores.append(sharpness if img is not None else 0)
@@ -347,7 +358,7 @@ def verify_multi_frame(usn: str, images: list[bytes]) -> dict:
             result = DeepFace.represent(
                 img_path=processed_path,
                 model_name=MODEL_NAME,
-                enforce_detection=False,
+                enforce_detection=True,
                 detector_backend=DETECTOR_BACKEND,
             )
             if result and len(result) > 0:
@@ -409,12 +420,16 @@ def identify_faces(image_bytes: bytes) -> list[dict]:
 
     try:
         # Extract ALL face embeddings from the image
-        results = DeepFace.represent(
-            img_path=processed_path,
-            model_name=MODEL_NAME,
-            enforce_detection=False,
-            detector_backend=DETECTOR_BACKEND,
-        )
+        try:
+            results = DeepFace.represent(
+                img_path=processed_path,
+                model_name=MODEL_NAME,
+                enforce_detection=True,
+                detector_backend=DETECTOR_BACKEND,
+            )
+        except Exception:
+            # No face detected
+            return []
 
         if not results:
             return []
@@ -438,6 +453,12 @@ def identify_faces(image_bytes: bytes) -> list[dict]:
             # Extract facial area bounding box from DeepFace result
             facial_area = face_result.get("facial_area", {})
 
+            # Skip tiny detections that are likely non-face artifacts
+            face_w = facial_area.get("w", 0)
+            face_h = facial_area.get("h", 0)
+            if face_w < MIN_FACE_AREA_PX or face_h < MIN_FACE_AREA_PX:
+                continue
+
             best_usn = None
             best_distance = float("inf")
 
@@ -451,13 +472,14 @@ def identify_faces(image_bytes: bytes) -> list[dict]:
 
             if best_usn and best_distance <= VERIFY_THRESHOLD:
                 confidence = round(max(0, (1 - best_distance / VERIFY_THRESHOLD) * 100), 1)
-                identified.append({
-                    "usn": best_usn,
-                    "confidence": confidence,
-                    "matched": True,
-                    "facial_area": facial_area,
-                })
-                used_usns.add(best_usn)
+                if confidence >= MIN_CONFIDENCE_FLOOR:
+                    identified.append({
+                        "usn": best_usn,
+                        "confidence": confidence,
+                        "matched": True,
+                        "facial_area": facial_area,
+                    })
+                    used_usns.add(best_usn)
 
         return identified
 
@@ -595,12 +617,18 @@ def identify_faces_with_grid(
         processed_path = _preprocess_for_distance(temp_path)
 
         try:
-            results = DeepFace.represent(
-                img_path=processed_path,
-                model_name=MODEL_NAME,
-                enforce_detection=False,
-                detector_backend=DETECTOR_BACKEND,
-            )
+            # enforce_detection=True prevents bogus embeddings from non-face regions
+            try:
+                results = DeepFace.represent(
+                    img_path=processed_path,
+                    model_name=MODEL_NAME,
+                    enforce_detection=True,
+                    detector_backend=DETECTOR_BACKEND,
+                )
+            except Exception:
+                # No face detected in this frame — skip it
+                per_photo_results.append({"photo": i + 1, "faces_detected": 0})
+                continue
 
             if not results:
                 per_photo_results.append({"photo": i + 1, "faces_detected": 0})
@@ -622,6 +650,13 @@ def identify_faces_with_grid(
                 face_emb = face_emb / (np.linalg.norm(face_emb) + 1e-10)
                 facial_area = face_result.get("facial_area", {})
 
+                # Skip tiny detections that are likely non-face artifacts
+                face_w = facial_area.get("w", 0)
+                face_h = facial_area.get("h", 0)
+                if face_w < MIN_FACE_AREA_PX or face_h < MIN_FACE_AREA_PX:
+                    logger.info(f"Photo {i+1}: skipping tiny detection ({face_w}x{face_h}px)")
+                    continue
+
                 best_usn = None
                 best_distance = float("inf")
 
@@ -636,6 +671,10 @@ def identify_faces_with_grid(
 
                 if best_usn and best_distance <= VERIFY_THRESHOLD:
                     confidence = round(max(0, (1 - best_distance / VERIFY_THRESHOLD) * 100), 1)
+                    # Reject matches below the minimum confidence floor
+                    if confidence < MIN_CONFIDENCE_FLOOR:
+                        logger.info(f"Photo {i+1}: rejecting {best_usn} (confidence={confidence}% < floor={MIN_CONFIDENCE_FLOOR}%)")
+                        continue
                     used_usns.add(best_usn)
                     photo_students.append(best_usn)
 
