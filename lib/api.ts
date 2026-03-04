@@ -114,8 +114,18 @@ export async function classAttendanceSession(
     return apiFetch<{
         photos_processed: number;
         students_identified: number;
-        marked_present: { usn: string; name: string; confidence: number }[];
+        marked_present: {
+            usn: string;
+            name: string;
+            confidence: number;
+            detected_count: number;
+            total_frames: number;
+            presence_ratio: number;
+            is_present: boolean;
+            grid_image_url: string | null;
+        }[];
         per_photo_results: { photo: number; faces_detected: number; students?: string[]; error?: string }[];
+        annotated_image_url: string | null;
     }>("/api/attendance/class-session", {
         method: "POST",
         body: JSON.stringify({ session_id, photos }),

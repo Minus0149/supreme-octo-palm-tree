@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback } from "react";
-import { Camera, CheckCircle2, AlertCircle, Users, Clock, Zap, Timer, XCircle } from "lucide-react";
+import { Camera, CheckCircle2, AlertCircle, Users, Clock, Zap, Timer, XCircle, Image as ImageIcon } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import {
@@ -28,6 +28,20 @@ type StudentTrackingInfo = {
     method: string;
 };
 
+type ScanResult = {
+    annotated_image_url: string | null;
+    marked_present: {
+        usn: string;
+        name: string;
+        confidence: number;
+        detected_count: number;
+        total_frames: number;
+        presence_ratio: number;
+        is_present: boolean;
+        grid_image_url: string | null;
+    }[];
+};
+
 type SessionState = "loading" | "idle" | "active" | "capturing" | "ended" | "error";
 
 export default function TakeAttendancePage() {
@@ -44,6 +58,8 @@ export default function TakeAttendancePage() {
     const [totalCaptures, setTotalCaptures] = useState(3);
     const [countdown, setCountdown] = useState(0);
     const [errorMsg, setErrorMsg] = useState<string | null>(null);
+    const [scanResult, setScanResult] = useState<ScanResult | null>(null);
+    const [previewGrid, setPreviewGrid] = useState<string | null>(null);
 
     // Camera Refs
     const videoRef = useRef<HTMLVideoElement>(null);
@@ -220,7 +236,11 @@ export default function TakeAttendancePage() {
     const submitPhotos = async (sId: number, photos: string[]) => {
         setCurrentState("loading");
         try {
-            await classAttendanceSession(sId, photos);
+            const res = await classAttendanceSession(sId, photos);
+            setScanResult({
+                annotated_image_url: res.annotated_image_url,
+                marked_present: res.marked_present,
+            });
             await fetchStudentList(sId);
             setCurrentState("active"); // Go back to active live view
         } catch (err) {
@@ -436,7 +456,7 @@ export default function TakeAttendancePage() {
 
                 {/* ENDED STATE */}
                 {currentState === "ended" && (
-                    <div className="max-w-2xl mx-auto mt-24">
+                    <div className="max-w-4xl mx-auto mt-12 space-y-6">
                         <Card className="rounded-none border-primary/20 bg-card/80 backdrop-blur text-center">
                             <CardContent className="pt-12 pb-12 space-y-6">
                                 <CheckCircle2 className="w-16 h-16 text-primary mx-auto mb-4" />
@@ -444,11 +464,80 @@ export default function TakeAttendancePage() {
                                 <p className="text-muted-foreground font-mono">
                                     Final Attendance: {presentStudents.length} / {totalStudents} Present
                                 </p>
+
+                                {/* Annotated Image */}
+                                {scanResult?.annotated_image_url && (
+                                    <div className="mt-6">
+                                        <h3 className="font-mono text-sm uppercase tracking-widest text-primary/70 mb-3 flex items-center justify-center gap-2">
+                                            <ImageIcon className="w-4 h-4" /> Last Frame — Annotated
+                                        </h3>
+                                        <img
+                                            src={scanResult.annotated_image_url}
+                                            alt="Annotated classroom"
+                                            className="mx-auto border border-primary/20 max-h-[400px] object-contain"
+                                        />
+                                    </div>
+                                )}
+
                                 <Button onClick={resetToIdle} className="mt-8 rounded-none uppercase font-mono tracking-widest px-8">
                                     Start Another Class
                                 </Button>
                             </CardContent>
                         </Card>
+
+                        {/* Per-Student Grid Images */}
+                        {scanResult && scanResult.marked_present.length > 0 && (
+                            <Card className="rounded-none border-primary/20 bg-card/80 backdrop-blur">
+                                <CardContent className="pt-6 pb-6">
+                                    <h3 className="font-mono text-sm uppercase tracking-widest text-primary mb-4 text-center">
+                                        Student Detection Grids
+                                    </h3>
+                                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                                        {scanResult.marked_present.map(s => (
+                                            <div
+                                                key={s.usn}
+                                                className={`border p-3 ${s.is_present
+                                                        ? 'border-primary/30 bg-primary/5'
+                                                        : 'border-destructive/30 bg-destructive/5'
+                                                    }`}
+                                            >
+                                                <div className="flex justify-between items-start mb-2">
+                                                    <div>
+                                                        <p className="font-mono text-sm font-bold">{s.name}</p>
+                                                        <p className="font-mono text-[10px] text-muted-foreground">{s.usn}</p>
+                                                    </div>
+                                                    <span className={`font-mono text-xs font-bold px-2 py-0.5 border ${s.is_present
+                                                            ? 'text-primary border-primary/30 bg-primary/10'
+                                                            : 'text-destructive border-destructive/30 bg-destructive/10'
+                                                        }`}>
+                                                        {s.is_present ? 'PRESENT' : 'ABSENT'}
+                                                    </span>
+                                                </div>
+                                                <div className="font-mono text-xs text-muted-foreground mb-2 space-y-1">
+                                                    <div>Detected: {s.detected_count} / {s.total_frames} frames ({(s.presence_ratio * 100).toFixed(1)}%)</div>
+                                                    <div>Avg Confidence: {s.confidence.toFixed(1)}%</div>
+                                                </div>
+                                                {s.grid_image_url && (
+                                                    <button
+                                                        onClick={() => setPreviewGrid(previewGrid === s.grid_image_url ? null : s.grid_image_url)}
+                                                        className="w-full text-center font-mono text-[10px] uppercase tracking-widest text-primary hover:text-primary/80 border border-primary/20 py-1 hover:bg-primary/5 transition-colors"
+                                                    >
+                                                        {previewGrid === s.grid_image_url ? 'Hide Grid' : 'View Detection Grid'}
+                                                    </button>
+                                                )}
+                                                {previewGrid === s.grid_image_url && s.grid_image_url && (
+                                                    <img
+                                                        src={s.grid_image_url}
+                                                        alt={`Detection grid for ${s.name}`}
+                                                        className="mt-2 w-full border border-primary/10"
+                                                    />
+                                                )}
+                                            </div>
+                                        ))}
+                                    </div>
+                                </CardContent>
+                            </Card>
+                        )}
                     </div>
                 )}
             </div>

@@ -1,11 +1,13 @@
+import os
 import base64
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from datetime import date, datetime
 from database import get_db
 import models, schemas
-from face_engine import verify_face, is_trained, identify_faces
+from face_engine import verify_face, is_trained, identify_faces, identify_faces_with_grid, PRESENCE_THRESHOLD, GRIDS_DIR
 
 router = APIRouter(prefix="/api/attendance", tags=["attendance"])
 
@@ -202,7 +204,9 @@ def student_scan_attendance(body: dict, db: Session = Depends(get_db)):
 @router.post("/class-session")
 def faculty_scan_attendance(body: dict, db: Session = Depends(get_db)):
     """
-    Faculty scanning room.
+    Faculty scanning room — batch photo processing with grid output.
+    Uses threshold-based presence: student is present if detected in
+    >= PRESENCE_THRESHOLD fraction of total frames.
     """
     session_id = body.get("session_id")
     photos: list = body.get("photos", [])
@@ -214,60 +218,79 @@ def faculty_scan_attendance(body: dict, db: Session = Depends(get_db)):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    all_identified: dict[str, float] = {} 
-    per_photo_results = []
-
-    for i, photo_b64 in enumerate(photos):
+    # Decode all base64 photos to bytes
+    photos_bytes = []
+    for photo_b64 in photos:
         try:
-            img_bytes = base64.b64decode(photo_b64)
-            faces_found = identify_faces(img_bytes)
-            per_photo_results.append({
-                "photo": i + 1,
-                "faces_detected": len(faces_found),
-                "students": [f["usn"] for f in faces_found],
-            })
-            for face in faces_found:
-                usn = face["usn"]
-                conf = face["confidence"]
-                if usn not in all_identified or conf > all_identified[usn]:
-                    all_identified[usn] = conf
-        except Exception as e:
-            per_photo_results.append({"photo": i + 1, "faces_detected": 0, "error": str(e)})
+            photos_bytes.append(base64.b64decode(photo_b64))
+        except Exception:
+            pass  # skip bad photos
 
+    if not photos_bytes:
+        raise HTTPException(status_code=400, detail="No valid photos provided")
+
+    # Run the grid-based identification engine
+    result = identify_faces_with_grid(photos_bytes, session_id)
+
+    # Update attendance records based on threshold results
     marked = []
-    for usn, confidence in all_identified.items():
+    for usn, student_data in result["students"].items():
         student = db.query(models.Student).filter(models.Student.usn == usn).first()
         if not student:
             continue
-        
+
         record = db.query(models.AttendanceRecord).filter(
             models.AttendanceRecord.student_id == student.id,
             models.AttendanceRecord.session_id == session.id
         ).first()
 
+        new_status = models.AttendanceStatus.present if student_data["is_present"] else models.AttendanceStatus.absent
+
         if record:
-            record.status = models.AttendanceStatus.present
-            record.confidence_score = confidence
+            record.status = new_status
+            record.confidence_score = student_data["avg_confidence"]
             record.method = models.AttendanceMethod.face
         else:
             record = models.AttendanceRecord(
                 student_id=student.id,
                 session_id=session.id,
-                status=models.AttendanceStatus.present,
-                confidence_score=confidence,
+                status=new_status,
+                confidence_score=student_data["avg_confidence"],
                 method=models.AttendanceMethod.face
             )
             db.add(record)
-            
-        marked.append({"usn": usn, "name": student.name, "confidence": confidence})
+
+        # Build grid image URL path (relative for frontend)
+        grid_url = None
+        if student_data.get("grid_image_path"):
+            grid_filename = os.path.basename(student_data["grid_image_path"])
+            grid_url = f"/api/attendance/grids/{grid_filename}"
+
+        marked.append({
+            "usn": usn,
+            "name": student.name,
+            "confidence": student_data["avg_confidence"],
+            "detected_count": student_data["detected_count"],
+            "total_frames": student_data["total_frames"],
+            "presence_ratio": student_data["presence_ratio"],
+            "is_present": student_data["is_present"],
+            "grid_image_url": grid_url,
+        })
 
     db.commit()
 
+    # Build annotated image URL
+    annotated_url = None
+    if result.get("annotated_image_path"):
+        annotated_filename = os.path.basename(result["annotated_image_path"])
+        annotated_url = f"/api/attendance/grids/{annotated_filename}"
+
     return {
-        "photos_processed": len(photos),
+        "photos_processed": len(photos_bytes),
         "students_identified": len(marked),
         "marked_present": marked,
-        "per_photo_results": per_photo_results,
+        "per_photo_results": result["per_photo_results"],
+        "annotated_image_url": annotated_url,
     }
 
 
@@ -368,3 +391,12 @@ def get_recent_logs(usn: str, limit: int = 10, db: Session = Depends(get_db)):
         }
         for r, sess, subj in records
     ]
+
+
+@router.get("/grids/{filename}")
+def serve_grid_image(filename: str):
+    """Serve generated grid and annotated images."""
+    filepath = os.path.join(GRIDS_DIR, filename)
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="Image not found")
+    return FileResponse(filepath, media_type="image/jpeg")

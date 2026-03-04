@@ -19,11 +19,19 @@ import numpy as np
 import cv2
 from PIL import Image
 
+import math
+
 logger = logging.getLogger(__name__)
 
 FACES_DIR = os.path.join(os.path.dirname(__file__), "data", "faces")
 ENCODINGS_DIR = os.path.join(os.path.dirname(__file__), "data", "encodings")
+GRIDS_DIR = os.path.join(os.path.dirname(__file__), "data", "grids")
 os.makedirs(ENCODINGS_DIR, exist_ok=True)
+os.makedirs(GRIDS_DIR, exist_ok=True)
+
+# ─── Presence Threshold ──────────────────────────────────────────
+# Student is marked present if detected in >= this fraction of total frames
+PRESENCE_THRESHOLD = 0.66
 
 # ─── Model Configuration ──────────────────────────────────────────
 MODEL_NAME = "ArcFace"
@@ -390,12 +398,9 @@ def get_all_trained_usns() -> list[str]:
 def identify_faces(image_bytes: bytes) -> list[dict]:
     """
     Detect ALL faces in a single image and compare each against ALL trained
-    student embeddings. Returns a list of matched students.
+    student embeddings. Returns a list of matched students with bounding boxes.
 
-    This is the core of faculty-driven attendance: one classroom photo
-    can identify multiple students at once.
-
-    Returns: [{'usn': str, 'confidence': float, 'matched': bool}, ...]
+    Returns: [{'usn': str, 'confidence': float, 'matched': bool, 'facial_area': dict}, ...]
     """
     DeepFace = _lazy_import()
 
@@ -430,6 +435,9 @@ def identify_faces(image_bytes: bytes) -> list[dict]:
             face_emb = np.array(face_result["embedding"])
             face_emb = face_emb / (np.linalg.norm(face_emb) + 1e-10)
 
+            # Extract facial area bounding box from DeepFace result
+            facial_area = face_result.get("facial_area", {})
+
             best_usn = None
             best_distance = float("inf")
 
@@ -447,6 +455,7 @@ def identify_faces(image_bytes: bytes) -> list[dict]:
                     "usn": best_usn,
                     "confidence": confidence,
                     "matched": True,
+                    "facial_area": facial_area,
                 })
                 used_usns.add(best_usn)
 
@@ -461,6 +470,248 @@ def identify_faces(image_bytes: bytes) -> list[dict]:
                 os.unlink(p)
             except OSError:
                 pass
+
+
+# ─── Bounding Box Drawing ─────────────────────────────────────────
+
+def _draw_bbox(img: np.ndarray, facial_area: dict, label: str, confidence: float) -> np.ndarray:
+    """
+    Draw a bounding box with label and confidence on the image.
+    Returns the annotated image (mutates in place).
+    """
+    x = facial_area.get("x", 0)
+    y = facial_area.get("y", 0)
+    w = facial_area.get("w", 0)
+    h = facial_area.get("h", 0)
+
+    if w == 0 or h == 0:
+        return img
+
+    color = (0, 255, 100)  # green
+    cv2.rectangle(img, (x, y), (x + w, y + h), color, 2)
+
+    text = f"{label} {confidence:.1f}%"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.5
+    thickness = 1
+
+    (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
+    cv2.rectangle(img, (x, y - th - 8), (x + tw + 4, y), (0, 0, 0), -1)
+    cv2.putText(img, text, (x + 2, y - 4), font, font_scale, color, thickness, cv2.LINE_AA)
+
+    return img
+
+
+def _crop_face(img: np.ndarray, facial_area: dict, padding: float = 0.3) -> np.ndarray:
+    """Crop the face region with padding from the image."""
+    x = facial_area.get("x", 0)
+    y = facial_area.get("y", 0)
+    w = facial_area.get("w", 0)
+    h = facial_area.get("h", 0)
+
+    if w == 0 or h == 0:
+        return img
+
+    img_h, img_w = img.shape[:2]
+    pad_x = int(w * padding)
+    pad_y = int(h * padding)
+
+    x1 = max(0, x - pad_x)
+    y1 = max(0, y - pad_y)
+    x2 = min(img_w, x + w + pad_x)
+    y2 = min(img_h, y + h + pad_y)
+
+    return img[y1:y2, x1:x2]
+
+
+def _make_grid_image(crops: list[np.ndarray], cell_size: int = 120) -> np.ndarray:
+    """
+    Stitch a list of face crops into a single grid image.
+    Each crop is resized to cell_size×cell_size.
+    """
+    n = len(crops)
+    if n == 0:
+        return np.zeros((cell_size, cell_size, 3), dtype=np.uint8)
+
+    cols = int(math.ceil(math.sqrt(n)))
+    rows = int(math.ceil(n / cols))
+
+    grid = np.zeros((rows * cell_size, cols * cell_size, 3), dtype=np.uint8)
+
+    for idx, crop in enumerate(crops):
+        r = idx // cols
+        c = idx % cols
+        resized = cv2.resize(crop, (cell_size, cell_size), interpolation=cv2.INTER_AREA)
+        grid[r * cell_size:(r + 1) * cell_size, c * cell_size:(c + 1) * cell_size] = resized
+
+    return grid
+
+
+# ─── Batch Processing with Grid ───────────────────────────────────
+
+def identify_faces_with_grid(
+    photos_bytes: list[bytes],
+    session_id: int,
+) -> dict:
+    """
+    Process a batch of photos for faculty-driven attendance.
+    For each photo, detect and identify faces. Track per-student detections
+    across all frames.
+
+    For each student:
+      - Crops the face with a bounding box annotation from each detection frame
+      - Stitches all detections into a single grid image
+      - Computes presence_ratio = detected_frames / total_frames
+      - Marks present if ratio >= PRESENCE_THRESHOLD
+
+    Returns:
+    {
+        "total_frames": int,
+        "per_photo_results": [...],
+        "students": {
+            "USN": {
+                "detected_count": int,
+                "total_frames": int,
+                "presence_ratio": float,
+                "is_present": bool,
+                "avg_confidence": float,
+                "grid_image_path": str | None,
+            }
+        },
+        "annotated_image_path": str | None   # last photo annotated with all boxes
+    }
+    """
+    DeepFace = _lazy_import()
+
+    total_frames = len(photos_bytes)
+
+    # Per-student tracking
+    # usn -> { "confidences": [float], "crops": [np.ndarray], "detected_frames": int }
+    student_tracker: dict[str, dict] = {}
+    per_photo_results = []
+
+    for i, photo_b64_bytes in enumerate(photos_bytes):
+        temp_path = _image_to_temp_path(photo_b64_bytes)
+        processed_path = _preprocess_for_distance(temp_path)
+
+        try:
+            results = DeepFace.represent(
+                img_path=processed_path,
+                model_name=MODEL_NAME,
+                enforce_detection=False,
+                detector_backend=DETECTOR_BACKEND,
+            )
+
+            if not results:
+                per_photo_results.append({"photo": i + 1, "faces_detected": 0})
+                continue
+
+            # Load all trained embeddings
+            trained_usns = get_all_trained_usns()
+            known = {}
+            for usn in trained_usns:
+                known[usn] = np.load(os.path.join(ENCODINGS_DIR, f"{usn}.npy"))
+
+            # Read the original image for annotation
+            img = cv2.imread(processed_path)
+            photo_students = []
+            used_usns = set()
+
+            for face_result in results:
+                face_emb = np.array(face_result["embedding"])
+                face_emb = face_emb / (np.linalg.norm(face_emb) + 1e-10)
+                facial_area = face_result.get("facial_area", {})
+
+                best_usn = None
+                best_distance = float("inf")
+
+                for usn, stored_emb in known.items():
+                    if usn in used_usns:
+                        continue
+                    dist = 1 - np.dot(stored_emb, face_emb)
+                    if dist < best_distance:
+                        best_distance = dist
+                        best_usn = usn
+
+                if best_usn and best_distance <= VERIFY_THRESHOLD:
+                    confidence = round(max(0, (1 - best_distance / VERIFY_THRESHOLD) * 100), 1)
+                    used_usns.add(best_usn)
+                    photo_students.append(best_usn)
+
+                    # Draw bounding box on the image
+                    if img is not None:
+                        _draw_bbox(img, facial_area, best_usn, confidence)
+                        face_crop = _crop_face(img, facial_area)
+                    else:
+                        face_crop = None
+
+                    # Track this student
+                    if best_usn not in student_tracker:
+                        student_tracker[best_usn] = {
+                            "confidences": [],
+                            "crops": [],
+                            "detected_frames": 0
+                        }
+                    student_tracker[best_usn]["confidences"].append(confidence)
+                    student_tracker[best_usn]["detected_frames"] += 1
+                    if face_crop is not None and face_crop.size > 0:
+                        student_tracker[best_usn]["crops"].append(face_crop.copy())
+
+            per_photo_results.append({
+                "photo": i + 1,
+                "faces_detected": len(results),
+                "students": photo_students,
+            })
+
+            # Save the last annotated image
+            if img is not None and i == total_frames - 1:
+                annotated_path = os.path.join(GRIDS_DIR, f"session_{session_id}_annotated.jpg")
+                cv2.imwrite(annotated_path, img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+
+        except Exception as e:
+            logger.error(f"Error processing photo {i + 1}: {e}")
+            per_photo_results.append({"photo": i + 1, "faces_detected": 0, "error": str(e)})
+        finally:
+            for p in [temp_path, processed_path]:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+    # Build final results per student
+    student_results = {}
+    for usn, data in student_tracker.items():
+        detected = data["detected_frames"]
+        ratio = detected / total_frames if total_frames > 0 else 0
+        avg_conf = round(sum(data["confidences"]) / len(data["confidences"]), 1) if data["confidences"] else 0
+
+        # Generate grid image from face crops
+        grid_path = None
+        if data["crops"]:
+            grid_img = _make_grid_image(data["crops"])
+            grid_filename = f"session_{session_id}_{usn}.jpg"
+            grid_path = os.path.join(GRIDS_DIR, grid_filename)
+            cv2.imwrite(grid_path, grid_img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+
+        student_results[usn] = {
+            "detected_count": detected,
+            "total_frames": total_frames,
+            "presence_ratio": round(ratio, 3),
+            "is_present": ratio >= PRESENCE_THRESHOLD,
+            "avg_confidence": avg_conf,
+            "grid_image_path": grid_path,
+        }
+
+    annotated_path = os.path.join(GRIDS_DIR, f"session_{session_id}_annotated.jpg")
+    if not os.path.exists(annotated_path):
+        annotated_path = None
+
+    return {
+        "total_frames": total_frames,
+        "per_photo_results": per_photo_results,
+        "students": student_results,
+        "annotated_image_path": annotated_path,
+    }
 
 
 # ─── Utilities ─────────────────────────────────────────────────────
