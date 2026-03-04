@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { getFaceStatus, uploadFaceFrames, getAttendanceSummary, getRecentLogs } from "@/lib/api";
 import { getAuthUser } from "@/app/actions";
+import { initializeFaceDetection, detectFace, type FaceDetectionResult } from "@/lib/face-detect";
 
 // Head movement instructions shown during scan
 const SCAN_STEPS = [
@@ -27,8 +28,24 @@ export default function StudentDashboard() {
     const [captureCount, setCaptureCount] = useState(0);
     const [scanStep, setScanStep] = useState(0);
     const [uploadError, setUploadError] = useState<string | null>(null);
+    const [detectionFeedback, setDetectionFeedback] = useState<FaceDetectionResult | null>(null);
+    const [cameras, setCameras] = useState<MediaDeviceInfo[]>([]);
+    const [selectedCamera, setSelectedCamera] = useState<string>("");
+
     const videoRef = useRef<HTMLVideoElement>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
+
+    // Initialize face detection on mount
+    useEffect(() => {
+        initializeFaceDetection();
+
+        // Get available cameras
+        navigator.mediaDevices.enumerateDevices().then(devices => {
+            const videoImputs = devices.filter(d => d.kind === 'videoinput');
+            setCameras(videoImputs);
+            if (videoImputs.length > 0) setSelectedCamera(videoImputs[0].deviceId);
+        }).catch(console.error);
+    }, []);
 
     // Attendance state
     const [attendance, setAttendance] = useState<{
@@ -77,68 +94,121 @@ export default function StudentDashboard() {
     }, [stream]);
 
     const initializeCamera = async () => {
+        if (stream) {
+            stream.getTracks().forEach(t => t.stop());
+        }
         try {
-            const ms = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: 640, height: 480 } });
+            const constraints: MediaStreamConstraints = {
+                video: selectedCamera
+                    ? { deviceId: { exact: selectedCamera }, width: 640, height: 480 }
+                    : { facingMode: "user", width: 640, height: 480 }
+            };
+            const ms = await navigator.mediaDevices.getUserMedia(constraints);
             setStream(ms);
             if (videoRef.current) videoRef.current.srcObject = ms;
+            setDetectionFeedback(null);
         } catch {
             alert("Could not access camera. Check browser permissions.");
         }
     };
 
+    // Detection loop when camera is on but not strictly registering
+    useEffect(() => {
+        let active = true;
+        let animationFrame: number;
+
+        const loop = async () => {
+            if (!videoRef.current || !stream || !active) return;
+            // Only detect if video is playing
+            if (videoRef.current.readyState === 4 && !isRegistering) {
+                const res = await detectFace(videoRef.current);
+                setDetectionFeedback(res);
+            }
+            if (active) {
+                animationFrame = requestAnimationFrame(loop);
+            }
+        };
+
+        if (stream && !isRegistering) {
+            loop();
+        }
+
+        return () => {
+            active = false;
+            cancelAnimationFrame(animationFrame);
+        };
+    }, [stream, isRegistering]);
+
     const startCaptureSequence = useCallback(async () => {
-        if (!videoRef.current || !canvasRef.current) return;
+        if (!videoRef.current || !canvasRef.current || !stream) return;
+
+        // Ensure models are loaded
+        const isLoaded = await initializeFaceDetection();
+        if (!isLoaded) {
+            setUploadError("Face detection models failed to load.");
+            return;
+        }
 
         setIsRegistering(true);
         setUploadError(null);
         setCaptureCount(0);
         setScanStep(0);
+        setDetectionFeedback(null);
 
         const ctx = canvasRef.current.getContext("2d");
         const blobs: Blob[] = [];
         const totalFrames = 30;
-        const stepInterval = Math.floor(totalFrames / SCAN_STEPS.length); // change prompt every ~5 frames
+        const framesPerStep = Math.floor(totalFrames / SCAN_STEPS.length);
 
         let count = 0;
 
         await new Promise<void>((resolve) => {
-            const interval = setInterval(() => {
+            const captureLoop = async () => {
                 if (count >= totalFrames) {
-                    clearInterval(interval);
                     resolve();
                     return;
                 }
 
-                // Update step prompt
-                setScanStep(Math.min(Math.floor(count / stepInterval), SCAN_STEPS.length - 1));
+                if (!videoRef.current || !ctx || !canvasRef.current) return;
 
-                if (videoRef.current && ctx && canvasRef.current) {
+                // Validate face before capturing
+                const res = await detectFace(videoRef.current);
+                setDetectionFeedback(res);
+
+                if (res.status === 'ok') {
+                    // Flash effect could be added here
                     ctx.drawImage(videoRef.current, 0, 0, canvasRef.current.width, canvasRef.current.height);
-                    canvasRef.current.toBlob((blob) => {
-                        if (blob) blobs.push(blob);
-                    }, "image/jpeg", 0.9);
+
+                    const blob = await new Promise<Blob | null>(res => canvasRef.current!.toBlob(res, "image/jpeg", 0.9));
+                    if (blob) {
+                        blobs.push(blob);
+                        count++;
+                        setCaptureCount(count);
+                        setScanStep(Math.min(Math.floor(count / framesPerStep), SCAN_STEPS.length - 1));
+                    }
                 }
 
-                count++;
-                setCaptureCount(count);
-            }, 150);
-        });
+                // Small delay to prevent capturing exact exact same frame and let user adjust
+                setTimeout(captureLoop, res.status === 'ok' ? 250 : 100);
+            };
 
-        // Stop camera
-        stream?.getTracks().forEach(t => t.stop());
-        setStream(null);
+            captureLoop();
+        });
 
         // Upload to backend
         try {
             if (!usn) throw new Error("User ID missing");
             await uploadFaceFrames(usn, blobs);
             setFaceStatus("pending");
+
+            // Stop camera on success
+            stream?.getTracks().forEach(t => t.stop());
+            setStream(null);
         } catch (err) {
             setUploadError(err instanceof Error ? err.message : "Upload failed");
-        } finally {
-            setIsRegistering(false);
+            setIsRegistering(false); // Let them try again
         }
-    }, [stream]);
+    }, [stream, usn]);
 
     const shortage = attendance
         ? Math.max(0, Math.ceil((0.75 * attendance.total_held) - attendance.total_present))
@@ -190,29 +260,49 @@ export default function StudentDashboard() {
                             ) : (
                                 <div className="space-y-4 text-center">
                                     {/* Camera viewfinder */}
-                                    <div className={`w-full aspect-square max-w-[220px] mx-auto border-2 ${isRegistering ? "border-primary border-solid shadow-[0_0_20px_rgba(20,180,180,0.3)]" : "border-border border-dashed"} flex items-center justify-center relative overflow-hidden bg-black/80`}>
-                                        <video ref={videoRef} autoPlay playsInline muted className={`w-full h-full object-cover ${stream ? "block" : "hidden"}`} />
-                                        {!stream && <UserPlaceholder />}
+                                    <div className="relative w-full aspect-[3/4] max-w-[280px] mx-auto overflow-hidden bg-black/90 rounded-2xl shadow-2xl ring-1 ring-border/50">
+                                        <video ref={videoRef} autoPlay playsInline muted className={`absolute inset-0 w-full h-full object-cover ${(stream && (!detectionFeedback || detectionFeedback.status === 'ok')) ? 'opacity-100' : 'opacity-50'} transition-opacity duration-300 ${stream ? "block" : "hidden"}`} />
 
-                                        {/* Scan overlay */}
-                                        {isRegistering && (
-                                            <>
-                                                {/* Corner brackets */}
-                                                <div className="absolute top-2 left-2 w-4 h-4 border-t-2 border-l-2 border-primary" />
-                                                <div className="absolute top-2 right-2 w-4 h-4 border-t-2 border-r-2 border-primary" />
-                                                <div className="absolute bottom-2 left-2 w-4 h-4 border-b-2 border-l-2 border-primary" />
-                                                <div className="absolute bottom-2 right-2 w-4 h-4 border-b-2 border-r-2 border-primary" />
-                                                {/* Scan line */}
-                                                <div className="absolute inset-0 pointer-events-none">
-                                                    <div className="w-full h-0.5 bg-primary/60 absolute animate-[scan_2s_ease-in-out_infinite]" />
+                                        {!stream && (
+                                            <div className="absolute inset-0 flex items-center justify-center">
+                                                <UserPlaceholder />
+                                            </div>
+                                        )}
+
+                                        {/* Dynamic Oval Overlay */}
+                                        {stream && (
+                                            <div className="absolute inset-0 pointer-events-none flex flex-col items-center justify-center px-4">
+                                                <div
+                                                    className={`w-full aspect-[3/4] max-h-[70%] rounded-[100%] border-[3px] transition-colors duration-300 ${!detectionFeedback ? 'border-dashed border-white/30' :
+                                                            detectionFeedback.status === 'ok' ? 'border-solid border-green-500 shadow-[0_0_20px_rgba(34,197,94,0.3)] inset-0' :
+                                                                'border-dashed border-yellow-500 opacity-60'
+                                                        }`}
+                                                >
+                                                    {/* Darken area outside oval (using a mask approach) */}
+                                                    <div className="absolute inset-[-100%] shadow-[inset_0_0_0_9999px_rgba(0,0,0,0.4)] mix-blend-multiply rounded-[100%] pointer-events-none"></div>
                                                 </div>
-                                                {/* Frame counter */}
-                                                <div className="absolute bottom-6 left-0 right-0 text-center">
-                                                    <span className="bg-black/80 text-primary font-mono text-[10px] px-2 py-1 border border-primary/30">
-                                                        FRAME {captureCount}/30
+
+                                                {/* HUD Feedback */}
+                                                <div className="absolute top-8 left-0 right-0 text-center px-4">
+                                                    <span className={`inline-block px-3 py-1 text-[11px] font-mono uppercase tracking-widest rounded-full backdrop-blur-md ${!detectionFeedback ? 'bg-black/50 text-white/70' :
+                                                            detectionFeedback.status === 'ok' ? 'bg-green-500/20 text-green-400 border border-green-500/50' :
+                                                                'bg-yellow-500/20 text-yellow-500 border border-yellow-500/50'
+                                                        }`}>
+                                                        {detectionFeedback ? detectionFeedback.message : 'Position your face'}
                                                     </span>
                                                 </div>
-                                            </>
+
+                                                {isRegistering && (
+                                                    <div className="absolute bottom-8 left-0 right-0 text-center">
+                                                        <div className="inline-flex items-center gap-2 bg-black/60 px-3 py-1.5 rounded-full border border-white/10">
+                                                            <div className="w-4 h-4 rounded-full border-2 border-primary border-t-transparent animate-spin"></div>
+                                                            <span className="text-white font-mono text-[10px]">
+                                                                {captureCount}/30
+                                                            </span>
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </div>
                                         )}
                                     </div>
 
@@ -247,15 +337,28 @@ export default function StudentDashboard() {
                                         </div>
                                     )}
 
-                                    <div>
+                                    {/* Controls */}
+                                    <div className="space-y-3">
+                                        {!stream && cameras.length > 1 && (
+                                            <select
+                                                value={selectedCamera}
+                                                onChange={e => setSelectedCamera(e.target.value)}
+                                                className="w-full bg-background border border-border text-xs font-mono p-2 rounded-none focus:outline-none"
+                                            >
+                                                {cameras.map(c => (
+                                                    <option key={c.deviceId} value={c.deviceId}>{c.label || 'Camera'}</option>
+                                                ))}
+                                            </select>
+                                        )}
+
                                         {stream ? (
                                             <Button
                                                 onClick={startCaptureSequence}
-                                                disabled={isRegistering}
-                                                className="w-full rounded-none font-mono text-xs"
-                                                variant="default"
+                                                disabled={isRegistering || (detectionFeedback?.status !== 'ok')}
+                                                className={`w-full rounded-none font-mono text-xs ${detectionFeedback?.status === 'ok' && !isRegistering ? 'bg-green-600 hover:bg-green-700 text-white' : ''}`}
+                                                variant={detectionFeedback?.status === 'ok' && !isRegistering ? 'default' : 'secondary'}
                                             >
-                                                {isRegistering ? "SCANNING..." : "▶ START SCAN"}
+                                                {isRegistering ? "CAPTURING..." : detectionFeedback?.status !== 'ok' ? "ALIGN FACE TO START" : "▶ START SCAN"}
                                             </Button>
                                         ) : (
                                             <Button
