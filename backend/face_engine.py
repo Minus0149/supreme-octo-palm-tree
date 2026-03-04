@@ -37,10 +37,10 @@ PRESENCE_THRESHOLD = 0.66
 MODEL_NAME = "ArcFace"
 DETECTOR_BACKEND = "retinaface"
 DISTANCE_METRIC = "cosine"
-VERIFY_THRESHOLD = 0.68  # ArcFace default cosine threshold (research shows 0.05-0.07 optimal in controlled environments)
+VERIFY_THRESHOLD = 0.25  # Lowered aggressively to prevent false positives (empirical cross-validation showed different people colliding at 0.30-0.45)
 
 # ─── Anti-False-Positive Config ───────────────────────────────────
-MIN_FACE_AREA_PX = 30     # Minimum face width/height in pixels to accept
+MIN_FACE_AREA_PX = 15     # Relaxed from 30 to 15 to allow detecting people further away in the classroom
 MIN_CONFIDENCE_FLOOR = 25.0  # Minimum confidence % to report a match
 
 # ─── Super-Resolution Config ──────────────────────────────────────
