@@ -46,6 +46,6 @@ __pycache__
 backend/data/faces/
 backend/data/encodings/
 backend/data/grids/
-backend/attendance.db
+# backend/attendance.db
 backend/__pycache__/
 backend/routers/__pycache__/
