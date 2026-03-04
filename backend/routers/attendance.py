@@ -55,6 +55,7 @@ def start_class_session(body: dict, db: Session = Depends(get_db)):
             models.AttendanceRecord(
                 student_id=st.id,
                 session_id=session.id,
+                date=date.today(),
                 status=models.AttendanceStatus.absent,
                 method=models.AttendanceMethod.manual # Default to manual until scanned
             )
@@ -185,6 +186,7 @@ def student_scan_attendance(body: dict, db: Session = Depends(get_db)):
         record = models.AttendanceRecord(
             student_id=student.id,
             session_id=session.id,
+            date=date.today(),
             status=models.AttendanceStatus.present if is_present else models.AttendanceStatus.absent,
             confidence_score=avg_confidence,
             method=models.AttendanceMethod.face
@@ -254,6 +256,7 @@ def faculty_scan_attendance(body: dict, db: Session = Depends(get_db)):
             record = models.AttendanceRecord(
                 student_id=student.id,
                 session_id=session.id,
+                date=date.today(),
                 status=new_status,
                 confidence_score=student_data["avg_confidence"],
                 method=models.AttendanceMethod.face
@@ -317,6 +320,7 @@ def manual_mark_attendance(body: dict, db: Session = Depends(get_db)):
         record = models.AttendanceRecord(
             student_id=student.id,
             session_id=session_id,
+            date=date.today(),
             status=status,
             method=models.AttendanceMethod.manual
         )
