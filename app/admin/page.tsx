@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { ShieldAlert, Plus, Trash2, RefreshCw, CheckCircle, Clock, XCircle, User } from "lucide-react";
+import { ShieldAlert, Plus, Trash2, RefreshCw, CheckCircle, Clock, XCircle, User, RotateCcw, ThumbsUp } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -32,6 +32,8 @@ export default function AdminDashboard() {
     const [showForm, setShowForm] = useState(false);
     const [submitting, setSubmitting] = useState(false);
     const [deletingUsn, setDeletingUsn] = useState<string | null>(null);
+    const [retrainingUsn, setRetrainingUsn] = useState<string | null>(null);
+    const [approvingUsn, setApprovingUsn] = useState<string | null>(null);
     const [form, setForm] = useState({ usn: "", name: "", dept: "CS", semester: "6", password: "" });
     const [formError, setFormError] = useState<string | null>(null);
 
@@ -88,6 +90,46 @@ export default function AdminDashboard() {
             setStudents(prev => prev.filter(s => s.usn !== usn));
         } finally {
             setDeletingUsn(null);
+        }
+    };
+
+    const handleRetrain = async (usn: string) => {
+        setRetrainingUsn(usn);
+        try {
+            const res = await fetch(`${API_BASE}/api/face/train/${usn}`, { method: "POST" });
+            if (res.ok) {
+                alert(`Retraining triggered for ${usn}. Model will update in a few seconds.`);
+                setTimeout(fetchStudents, 3000);
+            } else {
+                const err = await res.json();
+                alert(`Retrain failed: ${err.detail || "Unknown error"}`);
+            }
+        } catch {
+            alert("Cannot reach backend.");
+        } finally {
+            setRetrainingUsn(null);
+        }
+    };
+
+    const handleApprove = async (student: Student) => {
+        setApprovingUsn(student.usn);
+        try {
+            const res = await fetch(`${API_BASE}/api/face/approve`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ student_id: student.id }),
+            });
+            if (res.ok) {
+                alert(`Approved ${student.usn}. Training started in background.`);
+                setTimeout(fetchStudents, 5000);
+            } else {
+                const err = await res.json();
+                alert(`Approve failed: ${err.detail || "Unknown error"}`);
+            }
+        } catch {
+            alert("Cannot reach backend.");
+        } finally {
+            setApprovingUsn(null);
         }
     };
 
@@ -228,16 +270,42 @@ export default function AdminDashboard() {
                                                 </span>
                                             </td>
                                             <td className="px-4 py-3 text-right">
-                                                <Button
-                                                    size="sm"
-                                                    variant="ghost"
-                                                    disabled={deletingUsn === s.usn}
-                                                    onClick={() => handleDelete(s.usn)}
-                                                    className="rounded-none h-7 text-destructive hover:bg-destructive/10 hover:text-destructive font-mono text-[10px]"
-                                                >
-                                                    <Trash2 className="w-3 h-3 mr-1" />
-                                                    {deletingUsn === s.usn ? "..." : "Delete"}
-                                                </Button>
+                                                <div className="flex gap-1 justify-end">
+                                                    {s.face_status === "pending" && (
+                                                        <Button
+                                                            size="sm"
+                                                            variant="ghost"
+                                                            disabled={approvingUsn === s.usn}
+                                                            onClick={() => handleApprove(s)}
+                                                            className="rounded-none h-7 text-primary hover:bg-primary/10 hover:text-primary font-mono text-[10px]"
+                                                        >
+                                                            <ThumbsUp className="w-3 h-3 mr-1" />
+                                                            {approvingUsn === s.usn ? "..." : "Approve"}
+                                                        </Button>
+                                                    )}
+                                                    {(s.face_status === "trained" || s.face_status === "approved") && (
+                                                        <Button
+                                                            size="sm"
+                                                            variant="ghost"
+                                                            disabled={retrainingUsn === s.usn}
+                                                            onClick={() => handleRetrain(s.usn)}
+                                                            className="rounded-none h-7 text-blue-400 hover:bg-blue-400/10 hover:text-blue-400 font-mono text-[10px]"
+                                                        >
+                                                            <RotateCcw className="w-3 h-3 mr-1" />
+                                                            {retrainingUsn === s.usn ? "..." : "Retrain"}
+                                                        </Button>
+                                                    )}
+                                                    <Button
+                                                        size="sm"
+                                                        variant="ghost"
+                                                        disabled={deletingUsn === s.usn}
+                                                        onClick={() => handleDelete(s.usn)}
+                                                        className="rounded-none h-7 text-destructive hover:bg-destructive/10 hover:text-destructive font-mono text-[10px]"
+                                                    >
+                                                        <Trash2 className="w-3 h-3 mr-1" />
+                                                        {deletingUsn === s.usn ? "..." : "Delete"}
+                                                    </Button>
+                                                </div>
                                             </td>
                                         </tr>
                                     );

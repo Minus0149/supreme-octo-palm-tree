@@ -9,15 +9,23 @@ import { getFaceStatus, uploadFaceFrames, getAttendanceSummary, getRecentLogs } 
 import { getAuthUser } from "@/app/actions";
 import { initializeFaceDetection, detectFace, type FaceDetectionResult } from "@/lib/face-detect";
 
-// Head movement instructions shown during scan
+// Head movement instructions shown during scan (12 steps × 5 frames each = 60 total)
 const SCAN_STEPS = [
-    "Look STRAIGHT at the camera",
-    "Turn head SLIGHTLY LEFT",
-    "Turn head SLIGHTLY RIGHT",
-    "Tilt head UP slowly",
-    "Tilt head DOWN slowly",
-    "Look STRAIGHT — hold still",
+    "👀 Look STRAIGHT at the camera",
+    "⬅️ Slowly turn your head LEFT",
+    "👀 Look STRAIGHT again",
+    "➡️ Slowly turn your head RIGHT",
+    "👀 Come back to CENTER",
+    "⬆️ Tilt your head UP slightly",
+    "👀 Return to CENTER",
+    "⬇️ Tilt your head DOWN slightly",
+    "👀 Look STRAIGHT — hold still",
+    "😊 Smile naturally",
+    "😐 Neutral expression — hold still",
+    "✅ Almost done — hold steady",
 ];
+
+const TOTAL_FRAMES = 60; // ~1 minute of capture for maximum accuracy
 
 export default function StudentDashboard() {
     const [usn, setUsn] = useState<string | null>(null);
@@ -157,7 +165,7 @@ export default function StudentDashboard() {
 
         const ctx = canvasRef.current.getContext("2d");
         const blobs: Blob[] = [];
-        const totalFrames = 30;
+        const totalFrames = TOTAL_FRAMES;
         const framesPerStep = Math.floor(totalFrames / SCAN_STEPS.length);
 
         let count = 0;
@@ -255,7 +263,7 @@ export default function StudentDashboard() {
                                         <Camera className="w-10 h-10 animate-pulse" />
                                     </div>
                                     <p className="text-sm font-mono text-primary/70 uppercase tracking-widest">Pending Review</p>
-                                    <p className="text-[10px] font-mono text-muted-foreground uppercase">30 Frames Uploaded<br />Awaiting Faculty Approval</p>
+                                    <p className="text-[10px] font-mono text-muted-foreground uppercase">{TOTAL_FRAMES} Frames Uploaded<br />Awaiting Faculty Approval</p>
                                 </div>
                             ) : (
                                 <div className="space-y-4 text-center">
@@ -274,8 +282,8 @@ export default function StudentDashboard() {
                                             <div className="absolute inset-0 pointer-events-none flex flex-col items-center justify-center px-4">
                                                 <div
                                                     className={`w-full aspect-[3/4] max-h-[70%] rounded-[100%] border-[3px] transition-colors duration-300 ${!detectionFeedback ? 'border-dashed border-white/30' :
-                                                            detectionFeedback.status === 'ok' ? 'border-solid border-green-500 shadow-[0_0_20px_rgba(34,197,94,0.3)] inset-0' :
-                                                                'border-dashed border-yellow-500 opacity-60'
+                                                        detectionFeedback.status === 'ok' ? 'border-solid border-green-500 shadow-[0_0_20px_rgba(34,197,94,0.3)] inset-0' :
+                                                            'border-dashed border-yellow-500 opacity-60'
                                                         }`}
                                                 >
                                                     {/* Darken area outside oval (using a mask approach) */}
@@ -285,8 +293,8 @@ export default function StudentDashboard() {
                                                 {/* HUD Feedback */}
                                                 <div className="absolute top-8 left-0 right-0 text-center px-4">
                                                     <span className={`inline-block px-3 py-1 text-[11px] font-mono uppercase tracking-widest rounded-full backdrop-blur-md ${!detectionFeedback ? 'bg-black/50 text-white/70' :
-                                                            detectionFeedback.status === 'ok' ? 'bg-green-500/20 text-green-400 border border-green-500/50' :
-                                                                'bg-yellow-500/20 text-yellow-500 border border-yellow-500/50'
+                                                        detectionFeedback.status === 'ok' ? 'bg-green-500/20 text-green-400 border border-green-500/50' :
+                                                            'bg-yellow-500/20 text-yellow-500 border border-yellow-500/50'
                                                         }`}>
                                                         {detectionFeedback ? detectionFeedback.message : 'Position your face'}
                                                     </span>
@@ -297,7 +305,7 @@ export default function StudentDashboard() {
                                                         <div className="inline-flex items-center gap-2 bg-black/60 px-3 py-1.5 rounded-full border border-white/10">
                                                             <div className="w-4 h-4 rounded-full border-2 border-primary border-t-transparent animate-spin"></div>
                                                             <span className="text-white font-mono text-[10px]">
-                                                                {captureCount}/30
+                                                                {captureCount}/{TOTAL_FRAMES}
                                                             </span>
                                                         </div>
                                                     </div>
@@ -316,7 +324,7 @@ export default function StudentDashboard() {
                                             <p className="text-[10px] font-mono text-muted-foreground">
                                                 {faceStatus === "rejected"
                                                     ? "⚠ Registration rejected. Please re-scan."
-                                                    : "Status: UNREGISTERED — 30 samples required"}
+                                                    : "Status: UNREGISTERED — 60 samples required"}
                                             </p>
                                         )}
                                     </div>
@@ -332,7 +340,7 @@ export default function StudentDashboard() {
                                         <div className="w-full h-1 bg-border">
                                             <div
                                                 className="h-full bg-primary transition-all duration-150"
-                                                style={{ width: `${(captureCount / 30) * 100}% ` }}
+                                                style={{ width: `${(captureCount / TOTAL_FRAMES) * 100}% ` }}
                                             />
                                         </div>
                                     )}
