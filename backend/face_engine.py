@@ -31,17 +31,17 @@ os.makedirs(GRIDS_DIR, exist_ok=True)
 
 # ─── Presence Threshold ──────────────────────────────────────────
 # Student is marked present if detected in >= this fraction of total frames
-PRESENCE_THRESHOLD = 0.66
+PRESENCE_THRESHOLD = 0.30  # Lowered: 1 of 3 frames is enough if the match is strong
 
 # ─── Model Configuration ──────────────────────────────────────────
 MODEL_NAME = "ArcFace"
 DETECTOR_BACKEND = "retinaface"
 DISTANCE_METRIC = "cosine"
-VERIFY_THRESHOLD = 0.25  # Lowered aggressively to prevent false positives (empirical cross-validation showed different people colliding at 0.30-0.45)
+VERIFY_THRESHOLD = 0.40  # Strict enough to reject different people (empirical: different people collide at 0.30-0.47)
+CONFIDENCE_REFERENCE = 0.68  # Used ONLY for confidence % display (decoupled from matching threshold)
 
 # ─── Anti-False-Positive Config ───────────────────────────────────
-MIN_FACE_AREA_PX = 15     # Relaxed from 30 to 15 to allow detecting people further away in the classroom
-MIN_CONFIDENCE_FLOOR = 25.0  # Minimum confidence % to report a match
+MIN_FACE_AREA_PX = 15     # Allow detecting people further away in the classroom
 
 # ─── Super-Resolution Config ──────────────────────────────────────
 # Minimum face size (px) before we apply super-resolution upscaling
@@ -213,18 +213,19 @@ def train_student(usn: str) -> dict:
             result = DeepFace.represent(
                 img_path=processed_path,
                 model_name=MODEL_NAME,
-                enforce_detection=True,  # Critical: reject non-face frames from training
+                enforce_detection=True,
                 detector_backend=DETECTOR_BACKEND,
             )
             if result and len(result) > 0:
-                # Minimum size filter for training
-                facial_area = result[0].get("facial_area", {})
+                # Pick the LARGEST face by bounding box area (prevents interference contamination)
+                best_face = max(result, key=lambda r: r.get("facial_area", {}).get("w", 0) * r.get("facial_area", {}).get("h", 0))
+                facial_area = best_face.get("facial_area", {})
                 w, h = facial_area.get("w", 0), facial_area.get("h", 0)
                 if w < MIN_FACE_AREA_PX or h < MIN_FACE_AREA_PX:
                     logger.warning(f"Skipping {fname}: face too small ({w}x{h}px)")
                     continue
 
-                embedding = result[0]["embedding"]
+                embedding = best_face["embedding"]
                 all_embeddings.append(np.array(embedding))
                 quality_scores.append(sharpness if img is not None else 0)
         except Exception as e:
@@ -246,12 +247,40 @@ def train_student(usn: str) -> dict:
             "blurry_skipped": skipped,
         }
 
+    # ── Outlier Rejection ──────────────────────────────────────────
+    # Compute median embedding, then reject any embedding whose cosine
+    # distance to the median exceeds 2× the standard deviation.
+    emb_matrix = np.array(all_embeddings)
+    median_emb = np.median(emb_matrix, axis=0)
+    median_emb = median_emb / (np.linalg.norm(median_emb) + 1e-10)
+
+    distances_to_median = [1 - np.dot(e / (np.linalg.norm(e) + 1e-10), median_emb) for e in all_embeddings]
+    mean_dist = np.mean(distances_to_median)
+    std_dist = np.std(distances_to_median)
+    cutoff = mean_dist + 2 * std_dist
+
+    filtered_embeddings = []
+    filtered_scores = []
+    outliers_removed = 0
+    for idx, (emb, dist_to_med) in enumerate(zip(all_embeddings, distances_to_median)):
+        if dist_to_med <= cutoff:
+            filtered_embeddings.append(emb)
+            if idx < len(quality_scores):
+                filtered_scores.append(quality_scores[idx])
+        else:
+            outliers_removed += 1
+            logger.info(f"Outlier rejected: frame {idx} dist_to_median={dist_to_med:.4f} > cutoff={cutoff:.4f}")
+
+    if not filtered_embeddings:
+        filtered_embeddings = all_embeddings  # fallback: keep all if everything was "outlier"
+        filtered_scores = quality_scores
+
     # Weighted average: sharper frames contribute more to the final embedding
-    if quality_scores and max(quality_scores) > 0:
-        weights = np.array(quality_scores) / sum(quality_scores)
-        mean_embedding = np.average(all_embeddings, axis=0, weights=weights)
+    if filtered_scores and max(filtered_scores) > 0:
+        weights = np.array(filtered_scores) / sum(filtered_scores)
+        mean_embedding = np.average(filtered_embeddings, axis=0, weights=weights)
     else:
-        mean_embedding = np.mean(all_embeddings, axis=0)
+        mean_embedding = np.mean(filtered_embeddings, axis=0)
 
     # L2-normalize the embedding (standard practice for cosine similarity)
     mean_embedding = mean_embedding / (np.linalg.norm(mean_embedding) + 1e-10)
@@ -259,16 +288,22 @@ def train_student(usn: str) -> dict:
     out_path = os.path.join(ENCODINGS_DIR, f"{usn}.npy")
     np.save(out_path, mean_embedding)
 
+    # Also save multi-embeddings for pose-variant matching
+    multi_emb_matrix = np.array([e / (np.linalg.norm(e) + 1e-10) for e in filtered_embeddings])
+    multi_path = os.path.join(ENCODINGS_DIR, f"{usn}_multi.npy")
+    np.save(multi_path, multi_emb_matrix)
+
     logger.info(
-        f"Trained {usn}: {len(all_embeddings)}/{len(frame_files)} faces used, "
-        f"{skipped} blurry skipped, {sr_applied} super-resolved"
+        f"Trained {usn}: {len(filtered_embeddings)}/{len(frame_files)} faces used, "
+        f"{skipped} blurry skipped, {sr_applied} super-resolved, {outliers_removed} outliers rejected"
     )
     return {
         "success": True,
         "frames_processed": len(frame_files),
-        "faces_found": len(all_embeddings),
+        "faces_found": len(filtered_embeddings),
         "blurry_skipped": skipped,
         "super_resolved": sr_applied,
+        "outliers_rejected": outliers_removed,
         "encoding_path": out_path,
     }
 
@@ -296,12 +331,15 @@ def verify_face(usn: str, image_bytes: bytes) -> dict:
     processed_path = _preprocess_for_distance(temp_path)
 
     try:
-        result = DeepFace.represent(
-            img_path=processed_path,
-            model_name=MODEL_NAME,
-            enforce_detection=False,
-            detector_backend=DETECTOR_BACKEND,
-        )
+        try:
+            result = DeepFace.represent(
+                img_path=processed_path,
+                model_name=MODEL_NAME,
+                enforce_detection=True,
+                detector_backend=DETECTOR_BACKEND,
+            )
+        except Exception:
+            return {"matched": False, "confidence": 0.0, "error": "No face detected in image"}
 
         if not result or len(result) == 0:
             return {"matched": False, "confidence": 0.0, "error": "No face detected in image"}
@@ -314,8 +352,8 @@ def verify_face(usn: str, image_bytes: bytes) -> dict:
         # Compute cosine distance
         cosine_distance = 1 - np.dot(known_embedding, test_embedding)
 
-        # Convert distance to confidence percentage
-        confidence = round(max(0, (1 - cosine_distance / VERIFY_THRESHOLD) * 100), 1)
+        # Confidence uses CONFIDENCE_REFERENCE (decoupled from matching threshold)
+        confidence = round(max(0, (1 - cosine_distance / CONFIDENCE_REFERENCE) * 100), 1)
         matched = bool(cosine_distance <= VERIFY_THRESHOLD)
 
         return {"matched": matched, "confidence": confidence, "error": None}
@@ -382,7 +420,7 @@ def verify_multi_frame(usn: str, images: list[bytes]) -> dict:
     fused = fused / (np.linalg.norm(fused) + 1e-10)
 
     cosine_distance = 1 - np.dot(known_embedding, fused)
-    confidence = round(max(0, (1 - cosine_distance / VERIFY_THRESHOLD) * 100), 1)
+    confidence = round(max(0, (1 - cosine_distance / CONFIDENCE_REFERENCE) * 100), 1)
     matched = bool(cosine_distance <= VERIFY_THRESHOLD)
 
     return {
@@ -401,9 +439,35 @@ def get_all_trained_usns() -> list[str]:
     usns = []
     if os.path.isdir(ENCODINGS_DIR):
         for f in os.listdir(ENCODINGS_DIR):
-            if f.endswith(".npy"):
+            if f.endswith(".npy") and not f.endswith("_multi.npy"):
                 usns.append(f.replace(".npy", ""))
     return usns
+
+
+def _load_known_embeddings() -> dict[str, dict]:
+    """Load all trained embeddings. Returns {usn: {'mean': np.array, 'multi': np.array|None}}."""
+    trained_usns = get_all_trained_usns()
+    known = {}
+    for usn in trained_usns:
+        mean_emb = np.load(os.path.join(ENCODINGS_DIR, f"{usn}.npy"))
+        multi_path = os.path.join(ENCODINGS_DIR, f"{usn}_multi.npy")
+        multi_emb = np.load(multi_path) if os.path.exists(multi_path) else None
+        known[usn] = {"mean": mean_emb, "multi": multi_emb}
+    return known
+
+
+def _best_distance(face_emb: np.ndarray, student_data: dict) -> float:
+    """
+    Compute the minimum cosine distance between a face embedding and a student's
+    stored embeddings. Uses multi-embeddings if available for better pose coverage.
+    """
+    # Try multi-embedding matching first (min distance across all stored poses)
+    if student_data["multi"] is not None and len(student_data["multi"]) > 0:
+        dots = np.dot(student_data["multi"], face_emb)
+        dists = 1 - dots
+        return float(np.min(dists))
+    # Fallback to mean embedding
+    return float(1 - np.dot(student_data["mean"], face_emb))
 
 
 def identify_faces(image_bytes: bytes) -> list[dict]:
@@ -434,14 +498,10 @@ def identify_faces(image_bytes: bytes) -> list[dict]:
         if not results:
             return []
 
-        # Load all trained embeddings
-        trained_usns = get_all_trained_usns()
-        if not trained_usns:
+        # Load all trained embeddings (mean + multi)
+        known = _load_known_embeddings()
+        if not known:
             return []
-
-        known = {}
-        for usn in trained_usns:
-            known[usn] = np.load(os.path.join(ENCODINGS_DIR, f"{usn}.npy"))
 
         identified = []
         used_usns = set()  # prevent duplicate matches
@@ -462,24 +522,23 @@ def identify_faces(image_bytes: bytes) -> list[dict]:
             best_usn = None
             best_distance = float("inf")
 
-            for usn, stored_emb in known.items():
+            for usn, student_data in known.items():
                 if usn in used_usns:
                     continue
-                dist = 1 - np.dot(stored_emb, face_emb)
+                dist = _best_distance(face_emb, student_data)
                 if dist < best_distance:
                     best_distance = dist
                     best_usn = usn
 
             if best_usn and best_distance <= VERIFY_THRESHOLD:
-                confidence = round(max(0, (1 - best_distance / VERIFY_THRESHOLD) * 100), 1)
-                if confidence >= MIN_CONFIDENCE_FLOOR:
-                    identified.append({
-                        "usn": best_usn,
-                        "confidence": confidence,
-                        "matched": True,
-                        "facial_area": facial_area,
-                    })
-                    used_usns.add(best_usn)
+                confidence = round(max(0, (1 - best_distance / CONFIDENCE_REFERENCE) * 100), 1)
+                identified.append({
+                    "usn": best_usn,
+                    "confidence": confidence,
+                    "matched": True,
+                    "facial_area": facial_area,
+                })
+                used_usns.add(best_usn)
 
         return identified
 
@@ -634,11 +693,8 @@ def identify_faces_with_grid(
                 per_photo_results.append({"photo": i + 1, "faces_detected": 0})
                 continue
 
-            # Load all trained embeddings
-            trained_usns = get_all_trained_usns()
-            known = {}
-            for usn in trained_usns:
-                known[usn] = np.load(os.path.join(ENCODINGS_DIR, f"{usn}.npy"))
+            # Load all trained embeddings (mean + multi)
+            known = _load_known_embeddings()
 
             # Read the original image for annotation
             img = cv2.imread(processed_path)
@@ -660,21 +716,17 @@ def identify_faces_with_grid(
                 best_usn = None
                 best_distance = float("inf")
 
-                for usn, stored_emb in known.items():
+                for usn, student_data in known.items():
                     if usn in used_usns:
                         continue
-                    dist = 1 - np.dot(stored_emb, face_emb)
+                    dist = _best_distance(face_emb, student_data)
                     logger.info(f"Photo {i+1}: face vs {usn} => cosine_dist={dist:.4f} (threshold={VERIFY_THRESHOLD})")
                     if dist < best_distance:
                         best_distance = dist
                         best_usn = usn
 
                 if best_usn and best_distance <= VERIFY_THRESHOLD:
-                    confidence = round(max(0, (1 - best_distance / VERIFY_THRESHOLD) * 100), 1)
-                    # Reject matches below the minimum confidence floor
-                    if confidence < MIN_CONFIDENCE_FLOOR:
-                        logger.info(f"Photo {i+1}: rejecting {best_usn} (confidence={confidence}% < floor={MIN_CONFIDENCE_FLOOR}%)")
-                        continue
+                    confidence = round(max(0, (1 - best_distance / CONFIDENCE_REFERENCE) * 100), 1)
                     used_usns.add(best_usn)
                     photo_students.append(best_usn)
 
