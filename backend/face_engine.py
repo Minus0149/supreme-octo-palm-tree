@@ -162,16 +162,93 @@ def _preprocess_for_distance(img_path: str) -> str:
     return tmp.name
 
 
+# ─── Data Augmentation ────────────────────────────────────────────
+
+def _augment_image(img: np.ndarray) -> list[np.ndarray]:
+    """
+    Generate synthetic augmented variants of a face image.
+    Returns a list of augmented images (does NOT include the original).
+    Each variant simulates a different real-world condition.
+    """
+    augmented = []
+    h, w = img.shape[:2]
+
+    # 1. Horizontal flip (mirror view)
+    augmented.append(cv2.flip(img, 1))
+
+    # 2. Brightness jitter (+20% and -20%)
+    bright = cv2.convertScaleAbs(img, alpha=1.2, beta=15)
+    augmented.append(bright)
+    dark = cv2.convertScaleAbs(img, alpha=0.8, beta=-15)
+    augmented.append(dark)
+
+    # 3. Slight rotation (±8°)
+    for angle in [8, -8]:
+        center = (w // 2, h // 2)
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        rotated = cv2.warpAffine(img, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
+        augmented.append(rotated)
+
+    # 4. Gaussian noise (simulates low-light grain)
+    noise = np.random.normal(0, 10, img.shape).astype(np.int16)
+    noisy = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+    augmented.append(noisy)
+
+    return augmented
+
+
+def _extract_embedding(DeepFace, img_or_path, is_path: bool = True) -> np.ndarray | None:
+    """
+    Extract the best face embedding from an image (path or numpy array).
+    Returns None if no face is detected.
+    """
+    try:
+        if is_path:
+            result = DeepFace.represent(
+                img_path=img_or_path,
+                model_name=MODEL_NAME,
+                enforce_detection=True,
+                detector_backend=DETECTOR_BACKEND,
+            )
+        else:
+            # For augmented numpy arrays, save to temp file
+            tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+            cv2.imwrite(tmp.name, img_or_path, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            try:
+                result = DeepFace.represent(
+                    img_path=tmp.name,
+                    model_name=MODEL_NAME,
+                    enforce_detection=True,
+                    detector_backend=DETECTOR_BACKEND,
+                )
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+
+        if result and len(result) > 0:
+            best_face = max(result, key=lambda r: r.get("facial_area", {}).get("w", 0) * r.get("facial_area", {}).get("h", 0))
+            facial_area = best_face.get("facial_area", {})
+            fw, fh = facial_area.get("w", 0), facial_area.get("h", 0)
+            if fw < MIN_FACE_AREA_PX or fh < MIN_FACE_AREA_PX:
+                return None
+            return np.array(best_face["embedding"])
+    except Exception:
+        pass
+    return None
+
+
 # ─── Training ─────────────────────────────────────────────────────
 
 def train_student(usn: str) -> dict:
     """
-    Load all saved frames for a student, apply super-resolution if needed,
-    compute face embeddings via DeepFace + ArcFace, average them,
-    and persist to data/encodings/{usn}.npy.
+    Load all saved frames for a student, generate synthetic augmented
+    variants (flip, brightness, rotation, noise), compute face embeddings
+    via DeepFace + ArcFace, reject outliers, and persist embeddings.
 
-    Uses quality scoring to reject blurry frames and keep only
-    the sharpest captures for the embedding average.
+    60 real frames × ~6 augmentations = ~360 total embeddings for
+    maximum pose/lighting robustness.
     """
     DeepFace = _lazy_import()
     student_dir = os.path.join(FACES_DIR, usn)
@@ -192,6 +269,8 @@ def train_student(usn: str) -> dict:
     skipped = 0
     sr_applied = 0
 
+    augmented_count = 0
+
     for fname in frame_files:
         fpath = os.path.join(student_dir, fname)
 
@@ -210,28 +289,26 @@ def train_student(usn: str) -> dict:
             sr_applied += 1
 
         try:
-            result = DeepFace.represent(
-                img_path=processed_path,
-                model_name=MODEL_NAME,
-                enforce_detection=True,
-                detector_backend=DETECTOR_BACKEND,
-            )
-            if result and len(result) > 0:
-                # Pick the LARGEST face by bounding box area (prevents interference contamination)
-                best_face = max(result, key=lambda r: r.get("facial_area", {}).get("w", 0) * r.get("facial_area", {}).get("h", 0))
-                facial_area = best_face.get("facial_area", {})
-                w, h = facial_area.get("w", 0), facial_area.get("h", 0)
-                if w < MIN_FACE_AREA_PX or h < MIN_FACE_AREA_PX:
-                    logger.warning(f"Skipping {fname}: face too small ({w}x{h}px)")
-                    continue
-
-                embedding = best_face["embedding"]
-                all_embeddings.append(np.array(embedding))
+            # ── Extract embedding from original frame ──
+            emb = _extract_embedding(DeepFace, processed_path, is_path=True)
+            if emb is not None:
+                all_embeddings.append(emb)
                 quality_scores.append(sharpness if img is not None else 0)
+
+                # ── Generate augmented variants ──
+                if img is not None:
+                    augmented_imgs = _augment_image(img)
+                    for aug_img in augmented_imgs:
+                        aug_emb = _extract_embedding(DeepFace, aug_img, is_path=False)
+                        if aug_emb is not None:
+                            all_embeddings.append(aug_emb)
+                            quality_scores.append(sharpness * 0.8)  # Slightly lower weight for augmented
+                            augmented_count += 1
+            else:
+                logger.warning(f"Skipping {fname}: no face detected")
         except Exception as e:
             logger.warning(f"Skipping {fname}: {e}")
         finally:
-            # Clean up temp file from super-resolution
             if processed_path != fpath:
                 try:
                     os.unlink(processed_path)
@@ -294,13 +371,15 @@ def train_student(usn: str) -> dict:
     np.save(multi_path, multi_emb_matrix)
 
     logger.info(
-        f"Trained {usn}: {len(filtered_embeddings)}/{len(frame_files)} faces used, "
-        f"{skipped} blurry skipped, {sr_applied} super-resolved, {outliers_removed} outliers rejected"
+        f"Trained {usn}: {len(filtered_embeddings)} total embeddings "
+        f"({len(frame_files)} real frames, {augmented_count} augmented, "
+        f"{skipped} blurry skipped, {sr_applied} super-resolved, {outliers_removed} outliers rejected)"
     )
     return {
         "success": True,
         "frames_processed": len(frame_files),
         "faces_found": len(filtered_embeddings),
+        "augmented_generated": augmented_count,
         "blurry_skipped": skipped,
         "super_resolved": sr_applied,
         "outliers_rejected": outliers_removed,
